@@ -82,7 +82,7 @@ end
 # (maybe they should be linked to previous state for smooth transitions?)
 function generate_o(p::TruckMaintenance, s::Symbol, a::Symbol, sp::Symbol) # only sp matters
     distributions = p.sensor_dict[s]
-    o_vec = zeros(distributions)
+    o_vec = zeros(Float64, length(distributions))
     for i in 1:length(o_vec)
         o_vec[i] = rand(distributions[i])
     end
