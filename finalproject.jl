@@ -4,10 +4,31 @@ using Distributions
 using StatsBase
 using Statistics
 using LinearAlgebra
+using Random
+using ParticleFilters
+
+
+"""
+TruckState
+
+    fault - true/false
+    d     - distance since last repair
+"""
+struct TruckState
+    fault::Bool
+    d::Float64
+end
+
+struct TruckAction
+    repair::Bool
+    d::Float64
+end
 
 
 """
 TruckMaintenance
+
+    λ::Float  # mean failure rate
     sensor_dict::Dict{Symbol, Vector{<:Distribution}}
 
 
@@ -19,107 +40,170 @@ is the corresponding distribution for the nofault case
         :fault -                       # Vector
             [1]: Normal(μ, σ)          # any Distribution type
             [2]: Normal(μ, σ)
-            [3]: Normal(μ, σ)
             ...
 
         :nofault -                     # Vector
             [1]: Normal(μ, σ)          # any Distribution type
             [2]: Normal(μ, σ)
-            [3]: Normal(μ, σ)
             ...
-
 """
-struct TruckMaintenance
-    sensor_dict::Dict{Symbol, Vector{<:Distribution}} # consider parameterizing the type
+struct TruckMaintenance <: POMDP{TruckState, TruckAction, Vector{Float64}}
+    λ::Float64
+    sensor_dict::Dict{Bool, Vector{<:Distribution}} # consider parameterizing the type
 end
 
-# random Normal constructor
-function TruckMaintenance(n_sensors::Int)
+reliability(p::TruckMaintenance, s::TruckState) = exp(-s.d/ p.λ)
+rand_distance(p::TruckMaintenance, rng::AbstractRNG  = Random.GLOBAL_RNG= GLOBAL_RNG) = 3000.0*rand(rng) + 5.0
 
-    sensor_dict = Dict{Symbol, Vector{Normal}}()
-    sensor_dict[:fault]   = Vector{Normal}()
-    sensor_dict[:nofault] = Vector{Normal}()
+# getindex(D::Dict, s::TruckState) = D[s.fault]
+
+# random Normal constructor
+function TruckMaintenance(n_sensors::Int; λ = 10_000)
+
+    sensor_dict = Dict{Bool, Vector{Normal}}()
+    sensor_dict[true]   = Vector{Normal}()
+    sensor_dict[false] = Vector{Normal}()
     for i in 1:n_sensors
         μ = 10*rand()
         σ = 10*rand()
 
-        push!(sensor_dict[:nofault], Normal(μ, σ))
+        push!(sensor_dict[false], Normal(μ, σ))
 
         ### make slightly different distributions for :fault state
         # just pick values of 2 for no reason
         μ += 2*(rand()-0.5)  # ± 1
         σ *= 2*rand()        # scale by 0-2
-        push!(sensor_dict[:fault], Normal(μ, σ))
+        push!(sensor_dict[true], Normal(μ, σ))
     end
-    TruckMaintenance(sensor_dict)
+    TruckMaintenance(λ, sensor_dict)
 end
 
 
-function reward(p::TruckMaintenance, s::Symbol, a::Symbol)
+initial_state(p::TruckMaintenance) = TruckState(false, 0)
+discount(::TruckMaintenance) = 0.9
+
+
+
+
+
+
+function reward(p::TruckMaintenance, s::TruckState, a::TruckAction)
     r = 0.0
 
-    r -= (s == :fault)  ? 100 : 0
-    r -= (a == :repair) ?  10 : 0
+    r -= s.fault  ? 100 : 0
+    r -= a.repair ?  10 : 0
 
     return r
 end
 
-function generate_s(p::TruckMaintenance, s::Symbol, a::Symbol)
-    a == :repair && return (:nofault)
-    # ∴ a is :norepair —
-    s == :fault  && return (:fault)
-    # ∴ s is :nofault —
-    reliability = exp(-1/10000) ## 1 needs to be "distance" and 10000 needs to be "characterisitic distance"
-
-    if rand() > reliability
-        return (:fault)
+function generate_s(p::TruckMaintenance, s::TruckState, a::TruckAction, rng::AbstractRNG = Random.GLOBAL_RNG)
+    if a.repair
+        return TruckState(false, 0)
     end
 
-    return (:nofault)
+    if s.fault
+        return TruckState(true, s.d+a.d)
+    end
+    # ∴ s is :nofault —
+    if rand() > reliability(p, s)
+        return TruckState(true, s.d+a.d)
+    else
+        return TruckState(false, s.d+a.d)
+    end
 end
 
 # assumes each sensor measurement is independent and does not depend on previous measurements
 # (maybe they should be linked to previous state for smooth transitions?)
-function generate_o(p::TruckMaintenance, s::Symbol, a::Symbol, sp::Symbol) # only sp matters
-    distributions = p.sensor_dict[s]
-    o_vec = zeros(Float64, length(distributions))
+# function generate_o(p::TruckMaintenance, s::TruckState, a::Bool, sp::TruckState) # only sp matters
+#     o_vec = zeros(Float64, length(p.sensor_dict[sp]))
+#     for i in 1:length(o_vec)
+#         o_vec[i] = rand(p.sensor_dict[sp][i])
+#     end
+#     o_vec
+# end
+
+scl(d::Normal, x) = x.*d.σ .+ d.μ
+lerp(a, b, x) = a + x*(b-a)
+
+# TYPE PIRACY
+Distributions.pdf(Nvec::Vector{<:Normal}, x) = prod(pdf.(Nvec, x))
+
+# assumes each sensor measurement is independent and does not depend on previous measurements
+function generate_o(p::TruckMaintenance, s::TruckState, a::TruckAction, sp::TruckState, rng::AbstractRNG = Random.GLOBAL_RNG) # only sp matters
+    fault_dists   = p.sensor_dict[true]
+    nofault_dists = p.sensor_dict[false]
+
+    o_vec = zeros(Float64, length(fault_dists))
+    if sp.fault
+        for i in 1:length(o_vec)
+            o_vec[i] = rand(p.sensor_dict[sp][i])
+        end
+        return o_vec
+    end
+
     for i in 1:length(o_vec)
-        o_vec[i] = rand(distributions[i])
+        x = randn(rng)
+
+        fault_obs   = scl(fault_dists[i], x)
+        nofault_obs = scl(nofault_dists[i], x)
+
+        o_vec[i] = lerp(fault_obs, nofault_obs, 0.9*reliability(p, sp)) # when reliability is close to 1, the value is close to nofault but never reaches it
     end
     o_vec
 end
 
+function generate_sr(p::TruckMaintenance, s::TruckState, a::TruckAction, rng::AbstractRNG = Random.GLOBAL_RNG)
+    sp = generate_s(p, s, a, rng)
+    r = reward(p, sp, a)
+
+    return sp, r
+end
 
 
+# The other formulation method:
 
-#=
-The other formulation method:
+function observation(p::TruckMaintenance, sp::TruckState)
 
-function O(p::TruckMaintenance, o_vec::Vector, s::Symbol, a::Symbol) # not necessary for obs
-
-    total_prob = 1.0
-    for (i, o) in enumerate(o_vec)
-        total_prob *= pdf(p.sensor_dict[s][i], o)
-    end
-    return total_prob
+    return p.sensor_dict[sp]
 end
 
 # returns probabilty of entering :fault state
-function T(p::TruckMaintenance, s::Symbol, a::Symbol, sp::Symbol)
-
-    if a == :repair
-        sp == :fault          &&  return 0.0
-        sp == :nofault        &&  return 1.0
-    elseif a == :norepair
-        if s == :fault
-            sp == :fault      &&  return 1.0
-            sp == :nofault    &&  return 0.0
-        elseif s == :nofault
-            reliability = exp(-1/10000)
-            sp == :nofault    && return reliability    # f(distance/θ)
-            sp == :fault      && return 1-reliability
-        end
-    end
+function transition(p::TruckMaintenance, s::TruckState, a::TruckAction)
+    a.repair && return BoolDistribution(0.0)
+    # elseif:
+    s.fault && return BoolDistribution(1.0)
+    # else:
+    return BoolDistribution(1-reliability(p, s))
 end
 
-=#
+
+
+
+using MCTS
+using BeliefUpdaters
+using POMDPModelTools
+
+
+p = TruckMaintenance(3)
+
+n_particles = 100
+b = ParticleCollection([initial_state(p) for i in 1:n_particles])
+belief_updater = DiscreteUpdater(p)
+
+s = initial_state(p)
+a = TruckAction(false, 100)
+
+sp = generate_s(p, s, a)
+o = generate_o(p, s, a, sp)
+
+# update(belief_updater, b, a, o)
+
+
+
+
+
+
+
+
+
+
