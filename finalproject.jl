@@ -16,6 +16,8 @@ using POMDPModels # For the problem
 using BasicPOMCP # For the solver
 using POMDPPolicies # For creating a random policy
 using Printf
+using ARDESPOT, POMCPOW, BasicPOMCP,QMDP
+using AEMS
 
 #import just about everything
 import POMDPs: initial_state,
@@ -32,7 +34,8 @@ import POMDPs: initial_state,
     observation,
     transition,
     stateindex,
-    ordered_states
+    ordered_states,
+    actionindex
 
 
 
@@ -88,6 +91,8 @@ is the corresponding distribution for the nofault case
 struct TruckMaintenance <: POMDP{TruckState, TruckAction, Vector{Float64}}
     λ::Float64
     sensor_dict::Dict{Bool, Vector{<:Distribution}} # consider parameterizing the type
+    r_fault::Float64
+    r_repair::Float64
 end
 
 reliability(p::TruckMaintenance, s::TruckState) = exp(-s.d/ p.λ)
@@ -96,7 +101,7 @@ rand_distance(p::TruckMaintenance, rng::AbstractRNG = Random.GLOBAL_RNG) = 3000.
 Base.getindex(D::Dict, s::TruckState) = D[s.fault]
 
 # random Normal constructor
-function TruckMaintenance(n_sensors::Int; λ = 100_000)
+function TruckMaintenance(n_sensors::Int; λ = 100_000, r_fault = 100, r_repair = 50)
 
     sensor_dict = Dict{Bool, Vector{Normal}}()
     sensor_dict[true]   = Vector{Normal}()
@@ -113,7 +118,7 @@ function TruckMaintenance(n_sensors::Int; λ = 100_000)
         σ *= 2*rand()        # scale by 0-2
         push!(sensor_dict[true], Normal(μ, σ))
     end
-    TruckMaintenance(λ, sensor_dict)
+    TruckMaintenance(λ, sensor_dict,r_fault, r_repair)
 end
 
 
@@ -127,8 +132,9 @@ states(p::TruckMaintenance, s::TruckState)                 = [TruckState(false, 
 states(p::TruckMaintenance, s::TruckState, a::TruckAction) = [TruckState(false, s.d+a.d), TruckState(true, s.d+a.d)]
 
 n_actions(p::TruckMaintenance) = 2
-actions(p::TruckMaintenance) = [TruckAction(false, 1000), TruckAction(true, 1000)]
+actions(p::TruckMaintenance) = [TruckAction(false, rand(200:50:1500)), TruckAction(true, 0)]
 stateindex(p::TruckMaintenance, s::TruckState) = 2 - s.fault
+actionindex(p::TruckMaintenance, a::TruckAction) = 2 - a.repair
 initialstate_distribution(p::TruckMaintenance) = SparseCat(states(p), [1.0, 0.0])
 
 function POMDPSimulators.get_initialstate(sim::Simulator, initialstate_dist::BoolDistribution)
@@ -140,8 +146,8 @@ end
 function reward(p::TruckMaintenance, s::TruckState, a::TruckAction, sp::TruckState)
     r = 0.0
 
-    r -= sp.fault ? 100 : 0
-    r -= a.repair ?  50 : 0
+    r -= sp.fault ? p.r_fault : 0
+    r -= a.repair ? p.r_repair : 0
 
     return r
 end
@@ -200,9 +206,13 @@ end
 #     o_vec
 # end
 
+function generate_o(p::TruckMaintenance, s::TruckState, a::TruckAction, sp::TruckState, rng::AbstractRNG = Random.GLOBAL_RNG) # only sp matters
+    return [rand(rng,d) for d in observation(p,sp)]
+end
+
 function generate_sr(p::TruckMaintenance, s::TruckState, a::TruckAction, rng::AbstractRNG = Random.GLOBAL_RNG)
     sp = generate_s(p, s, a, rng)
-    r = reward(p, sp, a)
+    r = reward(p, s, a, sp)
 
     return sp, r
 end
@@ -211,7 +221,21 @@ end
 # The other formulation method:
 
 function observation(p::TruckMaintenance, sp::TruckState)
-    return p.sensor_dict[sp]
+
+    new_distributions = similar(p.sensor_dict[sp])
+
+    for i in 1:length(new_distributions)
+
+        df  = p.sensor_dict[true][i]
+        dnf = p.sensor_dict[false][i]
+
+        lerped_μ = lerp(dnf.μ, df.μ, 0.9*reliability(p, sp))
+        lerped_σ = lerp(dnf.σ, df.σ, 0.9*reliability(p, sp))
+
+        new_distributions[i] = Normal(lerped_μ, lerped_σ)
+    end
+
+    return new_distributions
 end
 
 # returns probabilty of entering :fault state
@@ -232,52 +256,117 @@ lerp(a, b, x) = a + x*(b-a)
 Distributions.pdf(Nvec::Vector{<:Normal}, x) = prod(pdf.(Nvec, x))
 POMDPs.pdf(d::BoolDistribution, s::TruckState) = pdf(d, s.fault)
 
-
-reward1 = []
-reward2 = []
 p = TruckMaintenance(10)
 belief_updater = SIRParticleFilter(p, 100)
-# belief_updater = DiscreteUpdater(p)
+lst_solver = [BeliefMCTSSolver(DPWSolver(), belief_updater),POMCPSolver(),DESPOTSolver(),POMCPOWSolver(), QMDPSolver() ]
+LstTime = []
+util = []
+#
+#
+# policy = solve(lst_solver[5], p)
+# history = simulate(HistoryRecorder(max_steps = 100), p, policy, belief_updater)
+# total = 0
+# k = 0
+# for (s, a, r, sp) in eachstep(history, "(s, a, r, sp)")
+#     println("State was $s,")
+#     println("action $a was taken,")
+#     global total = total + r
+#     push!(util, total)
+#     if s.fault
+#         global k = k + 1
+#     end
+# end
+# plot(util)
+# @show k
 
-solver = POMCPSolver()
-# # solver = BeliefMCTSSolver(DPWSolver(), belief_updater)
-policy = solve(solver, p)
+policy = solve(lst_solver[1], p)
 history = simulate(HistoryRecorder(max_steps = 100), p, policy, belief_updater)
 println("Total discounted reward: $(discounted_reward(history))")
-for (s, a, sp) in eachstep(history, "s,a,sp")
-    @printf("s: %-26s  a: %-6s  s': %-26s\n", s, a, sp)
-end
+policy = RandomPolicy(p)
+history = simulate(HistoryRecorder(max_steps = 100), p, policy, belief_updater)
+println("Total discounted reward: $(discounted_reward(history))")
+
+# for solver in lst_solver
+#     policy = solve(solver, p)
+#     avg = 0
+#     N = 10
+#     t1 = time_ns()
+#     for i = 1:N
+#         @show i
+#         history = simulate(HistoryRecorder(max_steps = 100), p, policy, belief_updater)
+#         avg = avg + discounted_reward(history)
+#     end
+#     avg = avg/N
+#     t2 = time_ns()
+#     elap = t2 - t1
+#     push!(util,avg)
+#     push!(LstTime,elap)
+# end
+
+
+# Lst = []
+# for i = 10:90
+#     p = TruckMaintenance(10,r_repair = i)
+#     belief_updater = SIRParticleFilter(p, 100)
+# # belief_updater = DiscreteUpdater(p)
+#     # solver = POMCPSolver()
+#     solver = BeliefMCTSSolver(DPWSolver(), belief_updater)
+#     policy = solve(solver, p)
+#     try
+#         history = simulate(HistoryRecorder(max_steps = 100), p, policy, belief_updater)
+#         println("Total discounted reward: $(discounted_reward(history))")
+#         lst = []
+#         for (s, a, sp) in eachstep(history, "s,a,sp")
+#             if a.repair
+#                 push!(lst,s.d)
+#             end
+#         end
+#         push!(Lst, mean(lst))
+#     catch err
+#     end
+# end
+
 # s = state_hist(history)[1]
 # a = action(policy, s)
 
-solver = POMCPSolver(tree_queries=5, c=10.0, rng=MersenneTwister(1))
-planner = solve(solver, p)
-a, info = action_info(planner, initialstate_distribution(p), tree_in_info=true)
+# p = TruckMaintenance(10,λ = 100000)
+# solver = POMCPSolver(tree_queries=5, c=10.0, rng=MersenneTwister(1))
+# planner = solve(solver, p)
+# a, info = action_info(planner, initialstate_distribution(p), tree_in_info=true)
+#
+# inchrome(D3Tree(info[:tree], init_expand=5))
 
-inchrome(D3Tree(info[:tree], init_expand=5))
-
-
+# p = TruckMaintenance(10,λ = 100000)
+# belief_updater = SIRParticleFilter(p, 100)
+# # belief_updater = DiscreteUpdater(p)
+# # solver = POMCPSolver()
+# solver = BeliefMCTSSolver(DPWSolver(), belief_updater)
+# policy = solve(solver, p)
 # for i = 1:50
+#     p = TruckMaintenance(10,λ = 100000)
+#     belief_updater = SIRParticleFilter(p, 100)
+#     solver = BeliefMCTSSolver(DPWSolver(), belief_updater)
+#     policy = solve(solver, p)
 #     history = simulate(HistoryRecorder(max_steps = 10), p, policy, belief_updater)
-    # tree = policy.tree
-    # for (s, b, a, o) in eachstep(history, "sbao")
-    #     println("State was $s,")
-    #     println("action $a was taken,")
-    #     println("and observation $o was received.\n")
-    # end
-    # println("MCTS Policy: Discounted reward was $(discounted_reward(history)).")
-
-    # policy = RandomPolicy(p)
-    # history = simulate(HistoryRecorder(max_steps = 10), p, policy, belief_updater)
-
-    # tree = policy.tree
-    # for (s, b, a, o) in eachstep(history, "sbao")
-    #     println("State was $s,")
-    #     println("action $a was taken,")
-    #     println("and observation $o was received.\n")
-    # end
-    # println("Random Policy: Discounted reward was $(discounted_reward(history)).")
-    # push!(reward2,discounted_reward(history))
+#     tree = policy.tree
+#     for (s, b, a, o) in eachstep(history, "sbao")
+#         println("State was $s,")
+#         println("action $a was taken,")
+#         println("and observation $o was received.\n")
+#     end
+#     println("MCTS Policy: Discounted reward was $(discounted_reward(history)).")
+#
+#     policy = RandomPolicy(p)
+#     history = simulate(HistoryRecorder(max_steps = 10), p, policy, belief_updater)
+#
+#     tree = policy.tree
+#     for (s, b, a, o) in eachstep(history, "sbao")
+#         println("State was $s,")
+#         println("action $a was taken,")
+#         println("and observation $o was received.\n")
+#     end
+#     println("Random Policy: Discounted reward was $(discounted_reward(history)).")
+#     push!(reward2,discounted_reward(history))
 # end
 # plot(reward1)
 # n_sensors = 3
