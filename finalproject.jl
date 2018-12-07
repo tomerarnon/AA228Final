@@ -1,23 +1,10 @@
-using POMDPs
 using Plots
-using StaticArrays
 using Distributions
-using StatsBase
-using Statistics
-using LinearAlgebra
-using Random
-using ParticleFilters
-using POMDPSimulators
-using POMDPModelTools
-using BeliefUpdaters
-using MCTS, BasicPOMCP, QMDP
-using POMDPs
-using POMDPModels # For the problem
-using BasicPOMCP # For the solver
-using POMDPPolicies # For creating a random policy
+using StatsBase, Statistics, LinearAlgebra, Random
+using ParticleFilters, BeliefUpdaters
+using POMDPs, POMDPModels, POMDPPolicies, POMDPModelTools, POMDPSimulators
+using ARDESPOT, POMCPOW, BasicPOMCP, QMDP, MCTS, AEMS
 using Printf
-using ARDESPOT, POMCPOW, BasicPOMCP,QMDP
-using AEMS
 
 #import just about everything
 import POMDPs: initial_state,
@@ -101,21 +88,25 @@ rand_distance(p::TruckMaintenance, rng::AbstractRNG = Random.GLOBAL_RNG) = 3000.
 Base.getindex(D::Dict, s::TruckState) = D[s.fault]
 
 # random Normal constructor
-function TruckMaintenance(n_sensors::Int; λ = 100_000, r_fault = 100, r_repair = 50)
+function TruckMaintenance(n_sensors::Int
+                          ;
+                          λ = 100_000,
+                          r_fault = 100,
+                          r_repair = 50)
 
     sensor_dict = Dict{Bool, Vector{Normal}}()
     sensor_dict[true]   = Vector{Normal}()
     sensor_dict[false] = Vector{Normal}()
     for i in 1:n_sensors
-        μ = 10*rand()
+        μ = 5*rand()
         σ = 10*rand()
 
         push!(sensor_dict[false], Normal(μ, σ))
 
         ### make slightly different distributions for :fault state
-        # for now, just pick values of 5, 2 for no reason
+        # for now, just pick values of 5, 4 for no reason
         μ += 5*(rand()-1)  # ± 2.5
-        σ *= 2*rand()        # scale by 0-2
+        σ *= 4*rand()        # scale by 0-4
         push!(sensor_dict[true], Normal(μ, σ))
     end
     TruckMaintenance(λ, sensor_dict,r_fault, r_repair)
@@ -125,23 +116,33 @@ end
 initial_state(p::TruckMaintenance) = TruckState(false, 0)
 discount(::TruckMaintenance) = 0.95
 
+n_actions(p::TruckMaintenance) = 2
 n_states(p::TruckMaintenance)  = 2
-ordered_states(p::TruckMaintenance)                        = states(TruckMaintenance)
-states(p::TruckMaintenance)                                = [TruckState(false, 0.0), TruckState(true, 0.0)]
-states(p::TruckMaintenance, s::TruckState)                 = [TruckState(false, s.d), TruckState(true, s.d)]
+
+ordered_states(p::TruckMaintenance)                        = states(p)
+initialstate_distribution(p::TruckMaintenance)             = SparseCat(states(p), [1.0, 0.0])
+
+states(p::TruckMaintenance)                                = [TruckState(false, 0.0),     TruckState(true, 0.0)]
+states(p::TruckMaintenance, s::TruckState)                 = [TruckState(false, s.d),     TruckState(true, s.d)]
 states(p::TruckMaintenance, s::TruckState, a::TruckAction) = [TruckState(false, s.d+a.d), TruckState(true, s.d+a.d)]
 
-n_actions(p::TruckMaintenance) = 2
-actions(p::TruckMaintenance) = [TruckAction(false, rand(200:50:1500)), TruckAction(true, 0)]
-stateindex(p::TruckMaintenance, s::TruckState) = 2 - s.fault
+actions(p::TruckMaintenance)                               = [TruckAction(false, rand(50:50:1500)), TruckAction(true, 0)]
+
+stateindex(p::TruckMaintenance, s::TruckState)   = 2 - s.fault
 actionindex(p::TruckMaintenance, a::TruckAction) = 2 - a.repair
-initialstate_distribution(p::TruckMaintenance) = SparseCat(states(p), [1.0, 0.0])
 
-function POMDPSimulators.get_initialstate(sim::Simulator, initialstate_dist::BoolDistribution)
-    f = rand(sim.rng, initialstate_dist)
-    return TruckState(f, 0.0)
+# function POMDPSimulators.get_initialstate(sim::Simulator, initialstate_dist::BoolDistribution)
+    # f = rand(sim.rng, initialstate_dist)
+    # return TruckState(f, 0.0)
+# end
+
+
+function generate_sr(p::TruckMaintenance, s::TruckState, a::TruckAction, rng::AbstractRNG = Random.GLOBAL_RNG)
+    sp = generate_s(p, s, a, rng)
+    r = reward(p, s, a, sp)
+
+    return sp, r
 end
-
 
 function reward(p::TruckMaintenance, s::TruckState, a::TruckAction, sp::TruckState)
     r = 0.0
@@ -207,18 +208,8 @@ end
 # end
 
 function generate_o(p::TruckMaintenance, s::TruckState, a::TruckAction, sp::TruckState, rng::AbstractRNG = Random.GLOBAL_RNG) # only sp matters
-    return [rand(rng,d) for d in observation(p,sp)]
+    return [rand(rng, d) for d in observation(p,sp)]
 end
-
-function generate_sr(p::TruckMaintenance, s::TruckState, a::TruckAction, rng::AbstractRNG = Random.GLOBAL_RNG)
-    sp = generate_s(p, s, a, rng)
-    r = reward(p, s, a, sp)
-
-    return sp, r
-end
-
-
-# The other formulation method:
 
 function observation(p::TruckMaintenance, sp::TruckState)
 
@@ -229,8 +220,10 @@ function observation(p::TruckMaintenance, sp::TruckState)
         df  = p.sensor_dict[true][i]
         dnf = p.sensor_dict[false][i]
 
-        lerped_μ = lerp(dnf.μ, df.μ, 0.9*reliability(p, sp))
-        lerped_σ = lerp(dnf.σ, df.σ, 0.9*reliability(p, sp))
+        # interpolate between fault and nofault according to reliability:
+        rel = reliability(p, sp)
+        lerped_μ = lerp(dnf.μ, df.μ, 0.9*rel)
+        lerped_σ = lerp(dnf.σ, df.σ, 0.9*rel)
 
         new_distributions[i] = Normal(lerped_μ, lerped_σ)
     end
@@ -249,27 +242,73 @@ function transition(p::TruckMaintenance, s::TruckState, a::TruckAction)
     return SparseCat(states(p, s, a), [rel, 1-rel])
 end
 
-scl(d::Normal, x) = x.*d.σ .+ d.μ
+scl(d::Normal, x) = @. x*d.σ + d.μ
 lerp(a, b, x) = a + x*(b-a)
 
 # TYPE PIRACY
 Distributions.pdf(Nvec::Vector{<:Normal}, x) = prod(pdf.(Nvec, x))
 POMDPs.pdf(d::BoolDistribution, s::TruckState) = pdf(d, s.fault)
 
-p = TruckMaintenance(10)
-belief_updater = SIRParticleFilter(p, 100)
-lst_solver = [BeliefMCTSSolver(DPWSolver(), belief_updater),POMCPSolver(),DESPOTSolver(),POMCPOWSolver(), QMDPSolver() ]
-LstTime = []
-util = []
-#
-#
+# p = TruckMaintenance(10)
+# belief_updater = SIRParticleFilter(p, 100)
+# lst_solver = [BeliefMCTSSolver(DPWSolver(), belief_updater), POMCPSolver(), DESPOTSolver(), POMCPOWSolver(), QMDPSolver()]
+# LstTime = []
+# util = []
+
+
+
+function simulate_a_bunch(solvers
+                            ;
+                          n_particles = 100,
+                          n_sensors = 10,
+                          n_sims = 50,
+                          max_steps = 100,
+                          λ = 100_000)
+
+    T_U_R_H_dict() = Dict(:T=>0.0, :U=>0.0, :rU=>0.0, :histories=>Vector{POMDPHistory}())
+    T_U_R_hists = Dict(sol=>T_U_R_H_dict() for sol in solvers)
+
+    for sol in solvers
+        println(sol)
+        t = total_reward = total_random_reward =  0.0
+        for i in 1:n_sims
+            print(i, ",")
+
+            # just in case some shenanigans go on that might mess things up,
+            # deepcopy the solver every time you use it.
+            use_sol = deepcopy(sol)
+            # recreate p each time so that the sensors values are randomized
+            p = TruckMaintenance(n_sensors)
+            belief_updater = SIRParticleFilter(p, n_particles)
+            policy = solve(use_sol, p)
+
+            # time the main runtime
+            t_start = time_ns()
+            history = simulate(HistoryRecorder(max_steps = 100), p, policy, belief_updater)
+            t_end   = time_ns()
+            # also run a random version
+            random_history = simulate(HistoryRecorder(max_steps = 100), p, RandomPolicy(p), belief_updater)
+
+            total_reward += sum(history.reward_hist)
+            total_random_reward += sum(random_history.reward_hist)
+
+            t += Float64(t_end - t_start) / 1E9
+            push!(T_U_R_hists[sol][:histories], history)
+        end
+        T_U_R_hists[sol][:T] = t/n_sims
+        T_U_R_hists[sol][:U] = total_reward/n_sims
+        T_U_R_hists[sol][:rU] = total_random_reward/n_sims
+    end
+
+    return T_U_R_hists
+end
+
 # policy = solve(lst_solver[5], p)
 # history = simulate(HistoryRecorder(max_steps = 100), p, policy, belief_updater)
 # total = 0
 # k = 0
 # for (s, a, r, sp) in eachstep(history, "(s, a, r, sp)")
-#     println("State was $s,")
-#     println("action $a was taken,")
+#     println("s => $(s.fault), $(s.d), \t a => $(a.repair), $(a.d)")
 #     global total = total + r
 #     push!(util, total)
 #     if s.fault
@@ -279,12 +318,12 @@ util = []
 # plot(util)
 # @show k
 
-policy = solve(lst_solver[1], p)
-history = simulate(HistoryRecorder(max_steps = 100), p, policy, belief_updater)
-println("Total discounted reward: $(discounted_reward(history))")
-policy = RandomPolicy(p)
-history = simulate(HistoryRecorder(max_steps = 100), p, policy, belief_updater)
-println("Total discounted reward: $(discounted_reward(history))")
+# policy = solve(lst_solver[1], p)
+# history = simulate(HistoryRecorder(max_steps = 100), p, policy, belief_updater)
+# println("Total discounted reward: $(discounted_reward(history))")
+# policy = RandomPolicy(p)
+# history = simulate(HistoryRecorder(max_steps = 100), p, policy, belief_updater)
+# println("Total discounted reward: $(discounted_reward(history))")
 
 # for solver in lst_solver
 #     policy = solve(solver, p)
@@ -333,7 +372,7 @@ println("Total discounted reward: $(discounted_reward(history))")
 # solver = POMCPSolver(tree_queries=5, c=10.0, rng=MersenneTwister(1))
 # planner = solve(solver, p)
 # a, info = action_info(planner, initialstate_distribution(p), tree_in_info=true)
-#
+
 # inchrome(D3Tree(info[:tree], init_expand=5))
 
 # p = TruckMaintenance(10,λ = 100000)
@@ -355,10 +394,10 @@ println("Total discounted reward: $(discounted_reward(history))")
 #         println("and observation $o was received.\n")
 #     end
 #     println("MCTS Policy: Discounted reward was $(discounted_reward(history)).")
-#
+
 #     policy = RandomPolicy(p)
 #     history = simulate(HistoryRecorder(max_steps = 10), p, policy, belief_updater)
-#
+
 #     tree = policy.tree
 #     for (s, b, a, o) in eachstep(history, "sbao")
 #         println("State was $s,")
@@ -374,7 +413,7 @@ println("Total discounted reward: $(discounted_reward(history))")
 #     μ = 10*rand()
 #     σ = 10*rand()
 #     display(display(plot(Normal(μ,σ),lw=3)))
-#
+
 #     ### make slightly different distributions for :fault state
 #     # for now, just pick values of 5, 2 for no reason
 #     μ += 5*(rand()-1)  # ± 2.5
