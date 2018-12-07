@@ -256,7 +256,14 @@ POMDPs.pdf(d::BoolDistribution, s::TruckState) = pdf(d, s.fault)
 # util = []
 
 
-
+# takes in a vector of literal solvers (i.e. like lst_solver above)
+# returns a dictionary of dictionaries
+# the outer dictionary are accessed with with solver literal
+# the inner dictionaries have keys:
+# :T         => average time
+# :U         => average reward
+# :rU        => average reward of a random policy
+# :histories => all of the recorded histories as a vector
 function simulate_a_bunch(solvers
                             ;
                           n_particles = 100,
